@@ -3,6 +3,7 @@ import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgb
 from pathlib import Path
 from scipy.cluster.hierarchy import linkage, dendrogram
 from scipy.spatial.distance import pdist
@@ -146,18 +147,30 @@ def cluster_columns(M):
     leaves = dendrogram(Z, no_plot=True)["leaves"]
     return Z, leaves
 
-def color_lookup(values):
-    # simple categorical palette (repeat if needed)
+def color_strip_from_categories(values):
+    """
+    Return:
+      strip: 1 x N x 3 float array for imshow (RGB in [0,1])
+      lut:   {category -> hex color} for the legend
+    """
+    vals = pd.Series(values, dtype="object").fillna("Other")
+    # Stable “first appearance” unique order
+    cats = vals.drop_duplicates().tolist()
+
+    # palette (extend/repeat if needed)
     palette = [
         "#6e40aa","#4277b3","#00a1c1","#1bb182","#6bbb57",
         "#b9c33d","#ffd33d","#fca636","#f17342","#e84e63","#cf3a86"
     ]
-    cats = pd.unique(values)
+    # map category -> color
     lut = {c: palette[i % len(palette)] for i, c in enumerate(cats)}
-    colors = [lut[c] for c in values]
-    return colors, lut
 
-def plot_clustermap(M, rows, cols_labels, categories, col_order, title, outpath, Z, leaves):
+    # build an RGB array (1 x N x 3) for imshow
+    rgb = np.array([to_rgb(lut[c]) for c in vals.tolist()], dtype=float)[None, :, :]
+    return rgb, lut
+
+
+def plot_clustermap(M, rows, cols_labels, categories, col_order, title, outpath, Z, leaves, metric):
     # order columns by dendrogram leaves
     M_ord = M[:, leaves]
     labels_ord = [col_order[i] for i in leaves]
@@ -180,11 +193,11 @@ def plot_clustermap(M, rows, cols_labels, categories, col_order, title, outpath,
     ax_dend.set_xticks([]); ax_dend.set_yticks([])
     ax_dend.set_title(title, pad=2)
 
-    # category strip
-    colors, lut = color_lookup(cats_ord)
-    ax_strip.imshow(np.array(colors)[None, :], aspect="auto")
+    strip_rgb, lut = color_strip_from_categories(cats_ord)
+    ax_strip.imshow(strip_rgb, aspect="auto")
     ax_strip.set_yticks([0]); ax_strip.set_yticklabels(["Category"])
     ax_strip.set_xticks([])
+
 
     # heatmap
     vmax = np.nanpercentile(np.abs(M_ord), 95)  # robust symmetric limits
@@ -237,7 +250,7 @@ def run_one(genotype, ref_order=None, ref_Z=None, suffix=""):
 
     title = f"{genotype} — {metric} (rows: {', '.join(rows)})"
     out = Path(out_png_dir) / f"clustermap_{genotype}_{metric}{suffix}_top{top_n}.png"
-    plot_clustermap(Mz, rows, cols_meta, categories, labels, title, str(out), Z, leaves)
+    plot_clustermap(Mz, rows, cols_meta, categories, labels, title, str(out), Z, leaves, metric)
     print(f"Saved: {out}")
     return labels, leaves, Z
 
