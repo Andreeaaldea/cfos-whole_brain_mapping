@@ -82,7 +82,9 @@ def process_sheet(df, sheet_name, outdir, top_n):
                         Path(outdir)/f"top{top_n}_{sheet_name}_d.png")
 
 def main(effects_xlsx, outdir, top_n):
-    sheets = ["WT_L","WT_R","WT_Delta","Shank3_L","Shank3_R","Shank3_Delta"]
+    sheets = ["WT_L_none","WT_R_none","WT_Delta_none","Shank3_L_none","Shank3_R_none","Shank3_Delta_none",
+              "WT_L_brain_mean","WT_R_brain_mean","WT_Delta_brain_mean",
+              "Shank3_L_brain_mean","Shank3_R_brain_mean","Shank3_Delta_brain_mean"]
     xls = pd.ExcelFile(effects_xlsx)
     for sh in sheets:
         if sh not in xls.sheet_names:
