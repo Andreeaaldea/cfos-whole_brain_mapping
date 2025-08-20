@@ -10,17 +10,12 @@ dict_without_headers = dict(zip(df["acronym"], df["g"]))
 val_only = df.values
 all_areas = df.to_dict()
 
-# Read specific columns (e.g., 'Column1' and 'Column3')
-columns_to_import = ['Acronym', 'dNormcohen_d']
-dd = pd.read_csv(file_path, usecols=columns_to_import)
-df = pd.DataFrame(dd)
-dict_without_headers = dict(zip(df["Acronym"], df["dNormcohen_d"]))
 
 # Create the 3D scene with brainrender
 scene = bgh.Heatmap(
     dict_without_headers,
     position=(8000, 5000, 5000),  # Adjust these values for position as needed
-    orientation="sagittal",  # Change to 'sagittal', 'horizontal', or a tuple (x,y,z)
+    orientation="horizontal",  # Change to 'sagittal', 'horizontal', or a tuple (x,y,z)
     thickness=500,  # Thickness of the section
     title="3D Heatmap - Frontal Orientation",
     vmin=-1.75,  # Minimum value for colormap

@@ -18,6 +18,9 @@ ref_genotype = "WT"               # use WT order as reference (so WT & Shank3 ar
 other_geno   = "Shank3"           # also plot using the same column order
 USE_ROW_ZSCORE_FOR_DISPLAY = False   # keep False for honest “novel vs familiar”
 METRIC_NAME = "g"                    # or "d"
+DELTA_FORMULA = "R-L"  # choose "R-L" (default) or "L-R"
+DELTA_LABEL   = f"Delta ({DELTA_FORMULA})"
+
 # ------------------------------------------
 
 Path(out_png_dir).mkdir(parents=True, exist_ok=True)
@@ -58,6 +61,43 @@ def ensure_category(df):
     out = df.copy()
     out["category"] = "Other"
     return out
+
+def compute_delta_sheet(dfL, dfR, metric="g", sign="R-L"):
+    """
+    Build a Delta dataframe from L & R with columns:
+      ['region_id','acronym','name','category', metric]
+    where `metric` holds Delta = (R-L) or (L-R).
+    Returns None if either L or R is missing.
+    """
+    if dfL is None or dfR is None:
+        return None
+
+    # Decide join key
+    key = "region_id" if ("region_id" in dfL.columns and "region_id" in dfR.columns) else None
+
+    # Minimal columns to carry through
+    colsL = [c for c in ["region_id","acronym","name","category",metric] if c in dfL.columns]
+    colsR = [c for c in ["region_id","acronym","name","category",metric] if c in dfR.columns]
+    L = dfL[colsL].rename(columns={metric: "L"})
+    R = dfR[colsR].rename(columns={metric: "R"})
+
+    if key:
+        # avoid duplicating meta columns from R on merge
+        dropR = [c for c in ["acronym","name","category"] if c in R.columns]
+        M = pd.merge(L, R.drop(columns=dropR), on=key, how="outer")
+    else:
+        M = pd.merge(L, R, on=["acronym","name","category"], how="outer")
+
+    # Compute Delta
+    if sign.upper() == "R-L":
+        M["Delta"] = M["R"] - M["L"]
+    else:
+        M["Delta"] = M["L"] - M["R"]
+
+    out = M.copy()
+    out[metric] = out["Delta"]
+    keep = [c for c in ["region_id","acronym","name","category",metric] if c in out.columns]
+    return out[keep]
 
 def build_matrix(df_L, df_R, df_D, metric="g"):
     """
@@ -150,6 +190,27 @@ def cluster_columns(M):
     Z = linkage(X.T, method="ward", metric="euclidean")
     leaves = dendrogram(Z, no_plot=True)["leaves"]
     return Z, leaves
+
+def align_rows(M, have_rows, want_rows):
+    """Reorder/add rows so M has rows in want_rows order (missing rows -> NaN)."""
+    have_rows = list(have_rows)
+    idx = {r: i for i, r in enumerate(have_rows)}
+    out = np.full((len(want_rows), M.shape[1]), np.nan, dtype=float)
+    for k, r in enumerate(want_rows):
+        if r in idx:
+            out[k, :] = M[idx[r], :]
+    return out
+
+def align_columns(M, have_labels, want_labels):
+    """Reorder/add columns so M has columns in want_labels order (missing cols -> NaN)."""
+    have_labels = list(have_labels)
+    idx = {c: i for i, c in enumerate(have_labels)}
+    out = np.full((M.shape[0], len(want_labels)), np.nan, dtype=float)
+    for j, c in enumerate(want_labels):
+        if c in idx:
+            out[:, j] = M[:, idx[c]]
+    return out
+
 
 def color_strip_from_categories(values):
     """
@@ -283,7 +344,7 @@ def plot_clustermap(
     h_strip = 0.28
     h_heat  = max(2.2, 0.28 * max(3, n_rows))
     total_h = h_dend + h_strip + h_heat
-    fig_w   = max(10, 0.32 * len(labels_ord))
+    fig_w   = max(10, 0.5 * len(labels_ord))
 
     fig = plt.figure(figsize=(fig_w, total_h), constrained_layout=False)
     ax_dend  = fig.add_axes([0.06, (h_strip + h_heat)/total_h, 0.91, h_dend/total_h])
@@ -292,7 +353,7 @@ def plot_clustermap(
 
     # ---------- dendrogram ----------
     if Z is not None and len(leaves) == n_cols:
-        dendrogram(Z, ax=ax_dend, no_labels=True, color_threshold=None)
+        dendrogram(Z, ax=ax_dend, no_labels=True, color_threshold=0)
     ax_dend.set_xticks([]); ax_dend.set_yticks([])
     ax_dend.set_title(title, pad=2)
 
@@ -337,7 +398,107 @@ def plot_clustermap(
     labels  = list(lut.keys())
     if handles:
         ax_heat.legend(handles, labels, title="Category",
-                       loc="upper left", bbox_to_anchor=(1.02,1.0), fontsize=8)
+                       loc="upper center", bbox_to_anchor=(1.05,1.5), fontsize=8)
+
+    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+#
+
+def plot_clustermap_dual(
+    M_ref, M_other,               # 2D arrays (rows x cols), same rows/cols
+    rows,                         # list[str], e.g. ["L","R","Delta"]
+    categories_ref,               # list[str] per column (from ref genotype)
+    col_labels,                   # list[str] per column
+    title,                        # overall title
+    title_ref, title_other,       # small titles for each heatmap
+    outpath,                      # save path
+    Z, leaves,                    # dendrogram & column order
+    metric_label="Novelty bias (PE − CT)",
+):
+    import matplotlib.pyplot as plt
+    from scipy.cluster.hierarchy import dendrogram
+
+    # Reorder columns by dendrogram leaves
+    M1 = M_ref[:, leaves]
+    M2 = M_other[:, leaves]
+    labels_ord = [col_labels[i] for i in leaves]
+    cats_ord   = [categories_ref[i] for i in leaves]
+
+    # Category strip (numeric RGB) + LUT
+    strip_rgb, lut = color_strip_from_categories(cats_ord)
+
+    # One symmetric color scale across BOTH panels
+    finite_vals = np.concatenate(
+        [M1[np.isfinite(M1)], M2[np.isfinite(M2)]]
+    ) if (np.isfinite(M1).any() or np.isfinite(M2).any()) else np.array([])
+    vmax = float(np.nanpercentile(np.abs(finite_vals), 95)) if finite_vals.size else 1.0
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+
+    # ----- layout -----
+    h_leg   = 0.50        # top legend row
+    h_dend  = 1.2
+    h_strip = 0.28
+    h_h1    = max(2.0, 0.28 * len(rows))
+    h_h2    = max(2.0, 0.28 * len(rows))
+    h_gap   = 0.08
+    total_h = h_leg + h_dend + h_strip + h_h1 + h_gap + h_h2
+
+    fig_w   = max(12, 0.5 * len(labels_ord))
+    fig = plt.figure(figsize=(fig_w, total_h), constrained_layout=False)
+
+    # axes (l, b, w, h)
+    ax_dend  = fig.add_axes([0.06, (h_strip + h_h1 + h_gap + h_h2)/total_h, 0.91, h_dend/total_h])
+    ax_strip = fig.add_axes([0.06, (h_h1 + h_gap + h_h2)/total_h,           0.91, h_strip/total_h])
+    ax_h1    = fig.add_axes([0.06, (h_gap + h_h2)/total_h,                  0.91, h_h1/total_h])
+    ax_h2    = fig.add_axes([0.06, 0.05,                                     0.91, (h_h2-0.05)/total_h])
+
+    # Top legend (category LUT)
+    handles = [plt.Line2D([0],[0], marker='s', color=clr, lw=0, markersize=8)
+               for _, clr in lut.items()]
+    labels  = list(lut.keys())
+    if handles:
+        fig.legend(handles, labels, title="Category",
+                   loc="upper center", bbox_to_anchor=(0.5, 1.5),
+                   ncol=min(len(handles), 6), frameon=False, fontsize=9)
+
+    # Dendrogram
+    if Z is not None and len(leaves) == M1.shape[1]:
+        dendrogram(Z, ax=ax_dend, no_labels=True, color_threshold=None)
+    ax_dend.set_xticks([]); ax_dend.set_yticks([])
+    ax_dend.set_title(title, pad=2)
+
+    # Category strip
+    ax_strip.imshow(strip_rgb, aspect="auto")
+    ax_strip.set_yticks([0]); ax_strip.set_yticklabels(["Category"])
+    ax_strip.set_xticks([])
+
+    # Heatmap 1 (ref)
+    im1 = ax_h1.imshow(M1, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    ax_h1.set_yticks(np.arange(len(rows))); ax_h1.set_yticklabels(rows)
+    ax_h1.set_xticks(np.arange(len(labels_ord))); ax_h1.set_xticklabels(labels_ord, rotation=90, fontsize=8)
+    for y in np.arange(len(rows)+1)-0.5: ax_h1.axhline(y, color="k", lw=0.3)
+    ax_h1.set_title(title_ref, loc="left", fontsize=11, pad=2)
+
+    # Heatmap 2 (other)
+    im2 = ax_h2.imshow(M2, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    ax_h2.set_yticks(np.arange(len(rows))); ax_h2.set_yticklabels(rows)
+    ax_h2.set_xticks(np.arange(len(labels_ord))); ax_h2.set_xticklabels(labels_ord, rotation=90, fontsize=8)
+    for y in np.arange(len(rows)+1)-0.5: ax_h2.axhline(y, color="k", lw=0.3)
+    ax_h2.set_title(title_other, loc="left", fontsize=11, pad=2)
+
+    # One colorbar for both
+    cax = fig.add_axes([0.98, 0.05, 0.015, (h_h1 + h_gap + h_h2)/total_h])
+    cb = plt.colorbar(im2, cax=cax)
+    cb.set_label(metric_label, rotation=90)
+    try:
+        cax.text(0.5, 1.02, "Novel ↑ (PE>CT)", ha="center", va="bottom", rotation=90,
+                 transform=cax.transAxes, fontsize=8)
+        cax.text(0.5, -0.02, "Familiar ↑ (CT>PE)", ha="center", va="top", rotation=90,
+                 transform=cax.transAxes, fontsize=8)
+    except Exception:
+        pass
 
     fig.savefig(outpath, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -347,7 +508,7 @@ def run_one(genotype, ref_order=None, ref_Z=None, suffix=""):
     # Load sheets for genotype
     df_L = load_sheet_like(effects_xlsx, f"{genotype}_L")
     df_R = load_sheet_like(effects_xlsx, f"{genotype}_R")
-    df_D = load_sheet_like(effects_xlsx, f"{genotype}_Delta")
+    df_D = load_sheet_like(effects_xlsx, f"{genotype}_Delta")  # optional, will be overridden
 
     if all(x is None for x in [df_L, df_R, df_D]):
         print(f"[ERROR] No sheets for genotype '{genotype}' in {effects_xlsx}")
@@ -356,42 +517,215 @@ def run_one(genotype, ref_order=None, ref_Z=None, suffix=""):
     # ensure category column
     df_L = ensure_category(df_L) if df_L is not None else None
     df_R = ensure_category(df_R) if df_R is not None else None
-    df_D = ensure_category(df_D) if df_D is not None else None
 
-    # Build raw matrix (so 0 truly means no effect)
+    # Always recompute Delta with your chosen convention
+    df_D = compute_delta_sheet(df_L, df_R, metric=METRIC_NAME, sign=DELTA_FORMULA)
+
+    # Build raw matrix
     M_raw, rows, cols_meta, categories, labels = build_matrix(df_L, df_R, df_D, metric=METRIC_NAME)
     if M_raw.size == 0:
         print(f"[ERROR] Empty matrix for genotype '{genotype}' after build_matrix.")
         return None
 
-    # Order columns: reuse reference order if provided; otherwise cluster
+    # Order columns
     if ref_order is not None and ref_Z is not None and len(ref_order) == M_raw.shape[1]:
         Z, leaves = ref_Z, ref_order
     else:
-        Mz_for_order = zscore_rows(M_raw.copy())  # cluster on pattern, not magnitude
-        Z, leaves = cluster_columns(Mz_for_order)
+        Z, leaves = cluster_columns(zscore_rows(M_raw.copy()))
 
-    # Plot using RAW values with zero-centered diverging map
-    title = f"{genotype} — {METRIC_NAME} (rows: {', '.join(rows)})"
+    # Replace 'Delta' tick label with explicit formula
+    rows_for_ticks = [DELTA_LABEL if r == "Delta" else r for r in rows]
+
+    title = f"{genotype} — {METRIC_NAME} (rows: {', '.join(rows_for_ticks)})"
     out = Path(out_png_dir) / f"clustermap_{genotype}_{METRIC_NAME}_novelty_top{top_n}.png"
-    plot_clustermap(M_raw, rows, cols_meta, categories, labels, title, str(out), Z, leaves)
+    plot_clustermap(M_raw, rows_for_ticks, cols_meta, categories, labels, title, str(out), Z, leaves)
 
     print(f"[OK] Saved {out}")
     return (labels, leaves, Z)
 
+def run_hemi_comparison(geno1="WT", geno2="Shank3", hemi="L"):
+    assert hemi in ("L","R"), "hemi must be 'L' or 'R'"
+
+    # Load the per-hemisphere sheets (effect sizes, PE vs CT)
+    df1 = load_sheet_like(effects_xlsx, f"{geno1}_{hemi}")
+    df2 = load_sheet_like(effects_xlsx, f"{geno2}_{hemi}")
+    if df1 is None or df2 is None:
+        print(f"[WARN] Missing {hemi} sheet(s) for {geno1}/{geno2}")
+        return
+
+    df1 = ensure_category(df1)
+    df2 = ensure_category(df2)
+
+    # Align by region_id if available, else acronym
+    key = "region_id" if "region_id" in df1.columns and "region_id" in df2.columns else "acronym"
+    merged = pd.merge(
+        df1[[key, "acronym", "name", "category", METRIC_NAME]],
+        df2[[key, METRIC_NAME]],
+        on=key, suffixes=(f"_{geno1}", f"_{geno2}")
+    )
+
+    # Build a 3-row matrix: WT, Shank3, WT − Shank3
+    data = []
+    rows = []
+    data.append(merged[f"{METRIC_NAME}_{geno1}"].to_numpy(float)); rows.append(f"{geno1} {hemi}")
+    data.append(merged[f"{METRIC_NAME}_{geno2}"].to_numpy(float)); rows.append(f"{geno2} {hemi}")
+    diff = merged[f"{METRIC_NAME}_{geno1}"] - merged[f"{METRIC_NAME}_{geno2}"]
+    data.append(diff.to_numpy(float)); rows.append(f"{geno1}-{geno2} ({hemi})")
+
+    M = np.vstack(data)
+    categories = merged["category"].astype(str).tolist()
+    labels = merged["acronym"].astype(str).tolist()
+
+    # Cluster columns on pattern across the 3 rows
+    Z, leaves = cluster_columns(zscore_rows(M.copy()))
+
+    title = f"{geno1} vs {geno2} — Hemisphere {hemi} ({METRIC_NAME})"
+    out = Path(out_png_dir) / f"clustermap_{geno1}_vs_{geno2}_{METRIC_NAME}_{hemi}.png"
+    plot_clustermap(
+        M, rows, None, categories, labels, title, str(out),
+        Z, leaves, metric_label=f"Novelty bias ({METRIC_NAME}: PE − CT)"
+    )
+    print(f"[OK] {hemi} comparison saved → {out}")
+
+def run_delta_comparison(geno1="WT", geno2="Shank3"):
+    # Load Delta (g(Δ)) sheets from your Excel
+    df1 = load_sheet_like(effects_xlsx, f"{geno1}_Delta")
+    df2 = load_sheet_like(effects_xlsx, f"{geno2}_Delta")
+    if df1 is None or df2 is None:
+        print("[WARN] Missing Delta sheets for comparison")
+        return
+
+    df1 = ensure_category(df1)
+    df2 = ensure_category(df2)
+
+    key = "region_id" if "region_id" in df1.columns and "region_id" in df2.columns else "acronym"
+    merged = pd.merge(
+        df1[[key, "acronym", "name", "category", METRIC_NAME]],
+        df2[[key, METRIC_NAME]],
+        on=key, suffixes=(f"_{geno1}", f"_{geno2}")
+    )
+
+    data = []
+    rows = []
+    data.append(merged[f"{METRIC_NAME}_{geno1}"].to_numpy(float)); rows.append(f"{geno1} Δ (g(Δ))")
+    data.append(merged[f"{METRIC_NAME}_{geno2}"].to_numpy(float)); rows.append(f"{geno2} Δ (g(Δ))")
+    diff = merged[f"{METRIC_NAME}_{geno1}"] - merged[f"{METRIC_NAME}_{geno2}"]
+    data.append(diff.to_numpy(float)); rows.append(f"{geno1}-{geno2} (Δ)")
+
+    M = np.vstack(data)
+    categories = merged["category"].astype(str).tolist()
+    labels = merged["acronym"].astype(str).tolist()
+
+    Z, leaves = cluster_columns(zscore_rows(M.copy()))
+
+    title = f"{geno1} vs {geno2} — Hemispheric Δ (g(Δ), {METRIC_NAME})"
+    out = Path(out_png_dir) / f"clustermap_{geno1}_vs_{geno2}_{METRIC_NAME}_Delta.png"
+    plot_clustermap(
+        M, rows, None, categories, labels, title, str(out),
+        Z, leaves, metric_label=f"Hemispheric lateralization (g(Δ))"
+    )
+    print(f"[OK] Δ comparison saved → {out}")
+
+
+def run_dual(genotype_ref, genotype_other, suffix=""):
+    # ----- load sheets -----
+    dfL_ref = load_sheet_like(effects_xlsx, f"{genotype_ref}_L")
+    dfR_ref = load_sheet_like(effects_xlsx, f"{genotype_ref}_R")
+    dfD_ref = load_sheet_like(effects_xlsx, f"{genotype_ref}_Delta")
+
+    dfL_oth = load_sheet_like(effects_xlsx, f"{genotype_other}_L")
+    dfR_oth = load_sheet_like(effects_xlsx, f"{genotype_other}_R")
+    dfD_oth = load_sheet_like(effects_xlsx, f"{genotype_other}_Delta")
+
+    if all(x is None for x in [dfL_ref, dfR_ref, dfD_ref]):
+        print(f"[ERROR] No sheets for reference genotype '{genotype_ref}'"); return
+    if all(x is None for x in [dfL_oth, dfR_oth, dfD_oth]):
+        print(f"[ERROR] No sheets for other genotype '{genotype_other}'"); return
+
+    # categories
+    dfL_ref = ensure_category(dfL_ref) if dfL_ref is not None else None
+    dfR_ref = ensure_category(dfR_ref) if dfR_ref is not None else None
+    dfL_oth = ensure_category(dfL_oth) if dfL_oth is not None else None
+    dfR_oth = ensure_category(dfR_oth) if dfR_oth is not None else None
+
+    # recompute Deltas
+    dfD_ref = compute_delta_sheet(dfL_ref, dfR_ref, metric=METRIC_NAME, sign=DELTA_FORMULA)
+    dfD_oth = compute_delta_sheet(dfL_oth, dfR_oth, metric=METRIC_NAME, sign=DELTA_FORMULA)
+
+    # build matrices
+    M_ref, rows_ref, cols_meta_ref, cats_ref, labels_ref = build_matrix(dfL_ref, dfR_ref, dfD_ref, metric=METRIC_NAME)
+    M_oth, rows_oth, cols_meta_oth, cats_oth, labels_oth = build_matrix(dfL_oth, dfR_oth, dfD_oth, metric=METRIC_NAME)
+
+    if M_ref.size == 0 or M_oth.size == 0:
+        print("[ERROR] Empty matrix in dual run."); return
+
+    want_rows = [r for r in rows_to_use if r in rows_ref] or rows_ref
+    M_ref = align_rows(M_ref, rows_ref, want_rows)
+    M_oth = align_rows(M_oth, rows_oth, want_rows)
+    M_oth = align_columns(M_oth, labels_oth, labels_ref)
+
+    Z, leaves = cluster_columns(zscore_rows(M_ref.copy()))
+
+    # explicit delta label on both panels
+    rows_for_ticks = [DELTA_LABEL if r == "Delta" else r for r in want_rows]
+
+    title_all   = f"{METRIC_NAME}: {genotype_ref} vs {genotype_other} (top {top_n} regions by REF)"
+    title_ref   = f"{genotype_ref}"
+    title_other = f"{genotype_other}"
+    out = Path(out_png_dir) / f"clustermap_{genotype_ref}_vs_{genotype_other}_{METRIC_NAME}_novelty_top{top_n}.png"
+
+    plot_clustermap_dual(
+        M_ref, M_oth, rows_for_ticks, cats_ref, labels_ref,
+        title_all, title_ref, title_other, str(out), Z, leaves,
+        metric_label=f"Novelty bias ({METRIC_NAME}: PE − CT)"
+    )
+    print(f"[OK] Dual clustermap saved → {out}")
+
+def run_delta_only(genotype, suffix="_delta_only"):
+    # Load only the Delta sheet (the one already in your Excel = g(Δ))
+    df_D = load_sheet_like(effects_xlsx, f"{genotype}_Delta")
+    if df_D is None:
+        print(f"[WARN] no Delta sheet for genotype {genotype}")
+        return
+
+    df_D = ensure_category(df_D)
+    # Build a “matrix” with just one row ("Delta")
+    M_raw, rows, cols_meta, categories, labels = build_matrix(
+        None, None, df_D, metric=METRIC_NAME
+    )
+
+    # Cluster by pattern
+    Mz_for_order = zscore_rows(M_raw.copy())
+    Z, leaves = cluster_columns(Mz_for_order)
+
+    # Plot raw values (not row z-scored)
+    title = f"{genotype} — Hemispheric Δ (g(Δ))"
+    out = Path(out_png_dir) / f"clustermap_{genotype}_{METRIC_NAME}_delta_only.png"
+    plot_clustermap(M_raw, rows, cols_meta, categories, labels,
+                    title, str(out), Z, leaves,
+                    metric_label="Hemispheric lateralization (PE − CT)")
+    
 
 def main():
-    # Reference genotype (WT) sets the column order
-    res = run_one(ref_genotype, ref_order=None, ref_Z=None, suffix="_ref")
-    if not res:
-        print("[FATAL] Could not build reference order. Check sheet names/paths.")
-        return
-    labels, leaves, Z = res
+    # Usual L+R clustermaps
+    #labels, leaves, Z = run_one(ref_genotype)
+    #if labels is not None:
+    #    run_one(other_geno, ref_order=leaves, ref_Z=Z,
+    #            suffix="_ordered_by_"+ref_genotype)
 
-    # Apply the same order to Shank3 so regions line up visually
-    res2 = run_one(other_geno, ref_order=leaves, ref_Z=Z, suffix=f"_ordered_by_{ref_genotype}")
-    if not res2:
-        print(f"[WARN] Skipped plotting for genotype '{other_geno}'.")
+    # Extra: Delta-only clustermaps
+    #run_delta_only(ref_genotype)
+    #run_delta_only(other_geno)
+        # Keep your per-genotype L+R if you like (optional)
+    # res = run_one(ref_genotype)
+    # if res:
+    #     run_one(other_geno, ref_order=res[1], ref_Z=res[2])
+
+    # WT vs Shank3 for L, R, and Δ (each includes a WT−Shank3 row)
+    run_hemi_comparison(ref_genotype, other_geno, hemi="L")
+    run_hemi_comparison(ref_genotype, other_geno, hemi="R")
+    run_delta_comparison(ref_genotype, other_geno)
+
 
 if __name__ == "__main__":
     main()

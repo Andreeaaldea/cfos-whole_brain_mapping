@@ -8,10 +8,10 @@ from pathlib import Path
 # ---------- CONFIG ----------
 collapsed_excel = r"Y:\public\projects\AnAl_20240405_Neuromod_PE\PE_mapping\processed_data\den_collapsed_matrix.xlsx"
 sheet_name      = "mean_cells_per_mm3"
-out_excel       = r"Y:\public\projects\AnAl_20240405_Neuromod_PE\PE_mapping\processed_data\effect_sizes_PE_vs_CT_by_hemi_with_categories.xlsx"
+out_excel       = r"Y:\public\projects\AnAl_20240405_Neuromod_PE\PE_mapping\processed_data\effect_sizes_PE_vs_CT_by_hemi_with_categories_norm.xlsx"
 
 # Optional per-mouse normalization: "none" or "brain_mean"
-normalization   = "none"
+normalization   = "brain_mean"
 mapping_csv     = None   # CSV with columns: mouse_base, genotype (WT/Shank3), condition (PE/CT)
 
 # Category map (prefixes of structure_id_path)

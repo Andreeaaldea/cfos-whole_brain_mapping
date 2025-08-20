@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # ================== CONFIG ==================
-effects_xlsx = r"Y:\public\projects\AnAl_20240405_Neuromod_PE\PE_mapping\processed_data\effect_sizes_PE_vs_CT_by_hemi_with_categories.xlsx"
-out_dir      = r"Y:\public\projects\AnAl_20240405_Neuromod_PE\PE_mapping\processed_data\ES_plots"
+effects_xlsx = r"Y:\public\projects\AnAl_20240405_Neuromod_PE\PE_mapping\processed_data\effect_sizes_PE_vs_CT_by_hemi_with_categories_norm.xlsx"
+out_dir      = r"Y:\public\projects\AnAl_20240405_Neuromod_PE\PE_mapping\processed_data\ES_plots_normalized"
 top_n        = 160               # top N regions by |metric| to plot
 metrics      = ["g", "d"]       # which metrics to plot; choose from {"g","d"}
 hemi_panels  = ["L","R","Delta"]  # which hemispheres to include
