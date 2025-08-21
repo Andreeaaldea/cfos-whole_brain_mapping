@@ -38,6 +38,50 @@ def ci_crosses_zero(lo, hi):
 
 Path(out_dir).mkdir(parents=True, exist_ok=True)
 
+def _pick_region_key_cols(df):
+    for k in ["region_id", "acronym", "name"]:
+        if k in df.columns:
+            return k
+    return None
+
+def _ensure_region_key(df):
+    keycol = _pick_region_key_cols(df)
+    if keycol is None:
+        df = df.copy()
+        df["region_key"] = df.index.astype(str)
+        return df, "region_key"
+    if keycol != "region_key":
+        df = df.copy()
+        df["region_key"] = df[keycol].astype(str)
+    return df, "region_key"
+
+def build_canonical_order(df_wt, df_sh, primary_metric="g"):
+    """
+    One stable ordering for a given hemisphere, used across ALL metrics.
+    Rank by max(|primary_metric|) across genotypes; tie-break alphabetically by region_key.
+    """
+    df_wt, key = _ensure_region_key(df_wt)
+    df_sh, _   = _ensure_region_key(df_sh)
+
+    # union of regions
+    all_keys = sorted(set(df_wt["region_key"]) | set(df_sh["region_key"]))
+    wt_vals = df_wt.set_index("region_key")[primary_metric] if primary_metric in df_wt.columns else None
+    sh_vals = df_sh.set_index("region_key")[primary_metric] if primary_metric in df_sh.columns else None
+
+    scores = []
+    for rk in all_keys:
+        vw = abs(float(wt_vals.get(rk))) if wt_vals is not None and pd.notna(wt_vals.get(rk)) else -np.inf
+        vs = abs(float(sh_vals.get(rk))) if sh_vals is not None and pd.notna(sh_vals.get(rk)) else -np.inf
+        # rank score: max abs value across genotypes
+        s = max(vw, vs)
+        scores.append((rk, s))
+
+    # sort by score desc, then by region_key asc for determinism
+    scores.sort(key=lambda t: (-t[1], t[0]))
+    region_order = [rk for rk, _ in scores]
+    return region_order
+
+
 def assign_category_from_path(path: str) -> str:
     p = "" if pd.isna(path) else str(path)
     for cat, prefix in category_map.items():
@@ -120,6 +164,64 @@ def make_category_summary(df, metric, hemi, genotype):
         })
     out = pd.DataFrame(rows).sort_values(f"median_abs_{metric}", ascending=False)
     return out
+from collections import Counter
+
+def build_label_map(df_wt, df_sh):
+    """
+    Return {region_key -> label} where region_key is the unique key we use
+    internally (region_id if available), but the label is the ACRONYM.
+    If acronyms collide, disambiguate by appending '(id)'.
+    """
+    def _one(df):
+        # choose key
+        if "region_id" in df.columns:
+            keys = df["region_id"].astype(str)
+        else:
+            keys = df.index.astype(str)
+        # choose label (prefer acronym, else name, else key)
+        if "acronym" in df.columns:
+            labs = df["acronym"].astype(str)
+        elif "name" in df.columns:
+            labs = df["name"].astype(str)
+        else:
+            labs = keys
+        return dict(zip(keys, labs))
+
+    m = {}
+    m.update(_one(df_wt))
+    m.update(_one(df_sh))
+
+    # disambiguate duplicate labels
+    counts = Counter(m.values())
+    if any(c > 1 for c in counts.values()):
+        # invert: label -> [keys...]
+        inv = {}
+        for k, lab in m.items(): inv.setdefault(lab, []).append(k)
+        for lab, ks in inv.items():
+            if len(ks) > 1:
+                for k in ks:
+                    m[k] = f"{lab} ({k})"  # append id to break ties
+
+    return m
+
+def _pick_region_key_cols(df):
+    # prefer unique id for internal alignment
+    for k in ["region_id", "acronym", "name"]:
+        if k in df.columns:
+            return k
+    return None
+
+def _ensure_region_key(df):
+    keycol = _pick_region_key_cols(df)
+    if keycol is None:
+        df = df.copy()
+        df["region_key"] = df.index.astype(str)
+        return df, "region_key"
+    if keycol != "region_key":
+        df = df.copy()
+        df["region_key"] = df[keycol].astype(str)
+    return df, "region_key"
+
 
 def plot_category_comparison(cat_df_wt, cat_df_sh, metric, hemi, outpath):
     """
@@ -168,124 +270,192 @@ def plot_category_comparison(cat_df_wt, cat_df_sh, metric, hemi, outpath):
     plt.savefig(outpath, dpi=150)
     plt.close()
 
-def build_top_overlap_plot(df_wt, df_sh, metric, hemi, top_n, outpath):
-    """
-    Overlapped region plot: same regions on one axis, WT vs Shank3 points + CIs, connected by a line.
-    Only keeps regions present in BOTH tables.
-    """
-    # Basic meta keys for labeling
-    label_cols = [c for c in ["acronym","name","region_id"] if c in df_wt.columns and c in df_sh.columns]
-    # intersect regions by region_id if available; else use acronym/name pair
-    if "region_id" in label_cols:
-        key = "region_id"
-        merged = df_wt.merge(df_sh, on=key, suffixes=("_WT","_Sh"))
-    else:
-        # fallback: join by acronym+name
-        keys = [c for c in ["acronym","name"] if c in label_cols]
-        merged = df_wt.merge(df_sh, on=keys, suffixes=("_WT","_Sh"))
-        key = keys[0] if keys else None
+def build_top_overlap_plot(df_wt, df_sh, metric, hemi, top_n, outpath, region_order, label_map):
+    df_wt, _ = _ensure_region_key(df_wt)
+    df_sh, _ = _ensure_region_key(df_sh)
 
-    if merged.empty:
-        print(f"[WARN] No overlapping regions between WT and Shank3 for {hemi}.")
-        return
+    rk_wt = set(df_wt["region_key"]); rk_sh = set(df_sh["region_key"])
+    overlap = [rk for rk in region_order if rk in rk_wt and rk in rk_sh]
+    if not overlap:
+        print(f"[WARN] No overlapping regions between WT and Shank3 for {hemi}."); return
+    chosen = overlap[:top_n]
 
-    # compute ranking by max absolute metric across genotypes
-    merged["_rank_val"] = np.nanmax(
-        np.vstack([ np.abs(merged[f"{metric}_WT"].to_numpy(float)),
-                    np.abs(merged[f"{metric}_Sh"].to_numpy(float)) ]),
-        axis=0
-    )
-    merged = merged.sort_values("_rank_val", ascending=False).head(top_n)
+    wt_idx = df_wt.set_index("region_key"); sh_idx = df_sh.set_index("region_key")
+    vW = wt_idx.loc[chosen, metric].to_numpy(float); vS = sh_idx.loc[chosen, metric].to_numpy(float)
 
-    # Labels
-    def pick_label(r):
-        for c in ["acronym","name",key]:
-            col = c+"_WT" if c+"_WT" in r else c
-            if col in r and pd.notna(r[col]):
-                return str(r[col])
-        return str(r.name)
-
-    labels = [pick_label(r) for _, r in merged.iterrows()]
-    y = np.arange(len(merged))[::-1]  # top at top
-
-    # Values + CI
-    vW = merged[f"{metric}_WT"].to_numpy(float)
-    lW = merged.get(f"{metric}_lo_WT", pd.Series([np.nan]*len(merged))).to_numpy(float)
-    hW = merged.get(f"{metric}_hi_WT", pd.Series([np.nan]*len(merged))).to_numpy(float)
-    vS = merged[f"{metric}_Sh"].to_numpy(float)
-    lS = merged.get(f"{metric}_lo_Sh", pd.Series([np.nan]*len(merged))).to_numpy(float)
-    hS = merged.get(f"{metric}_hi_Sh", pd.Series([np.nan]*len(merged))).to_numpy(float)
-
-    # If CI columns weren’t preserved by merge names, try raw names
-    if np.all(~np.isfinite(lW)) and f"{metric}_lo" in df_wt.columns:
-        lW = merged[f"{metric}_lo"].to_numpy(float)
-        hW = merged[f"{metric}_hi"].to_numpy(float)
-    if np.all(~np.isfinite(lS)) and f"{metric}_lo" in df_sh.columns:
-        lS = merged[f"{metric}_lo"].to_numpy(float)
-        hS = merged[f"{metric}_hi"].to_numpy(float)
+    lW = wt_idx.loc[chosen, f"{metric}_lo"].to_numpy(float) if f"{metric}_lo" in wt_idx.columns else np.full(len(chosen), np.nan)
+    hW = wt_idx.loc[chosen, f"{metric}_hi"].to_numpy(float) if f"{metric}_hi" in wt_idx.columns else np.full(len(chosen), np.nan)
+    lS = sh_idx.loc[chosen, f"{metric}_lo"].to_numpy(float) if f"{metric}_lo" in sh_idx.columns else np.full(len(chosen), np.nan)
+    hS = sh_idx.loc[chosen, f"{metric}_hi"].to_numpy(float) if f"{metric}_hi" in sh_idx.columns else np.full(len(chosen), np.nan)
 
     errW = [np.clip(vW - lW, 0, None), np.clip(hW - vW, 0, None)]
     errS = [np.clip(vS - lS, 0, None), np.clip(hS - vS, 0, None)]
 
-    plt.figure(figsize=(11, max(6, len(labels)*0.35)))
-    # connecting lines
+    # y-axis: reverse so “top” is at top; labels are acronyms
+    y = np.arange(len(chosen))[::-1]
+    ylabels = [label_map.get(k, str(k)) for k in chosen][::-1]
+
+    plt.figure(figsize=(11, max(6, len(chosen)*0.35)))
     for i in range(len(y)):
         plt.plot([vW[i], vS[i]], [y[i], y[i]], "-", alpha=0.4)
-
-    # WT and Sh points with CIs
     plt.errorbar(vW, y, xerr=errW, fmt="o", capsize=3, label="WT")
     plt.errorbar(vS, y, xerr=errS, fmt="o", capsize=3, label="Shank3")
-
     plt.axvline(0, ls="--")
-    plt.yticks(y, labels)
+    plt.yticks(y, ylabels)
     plt.xlabel(f"{metric} (95% CI)")
-    plt.title(f"{hemi}: WT vs Shank3 (top {len(labels)} by |{metric}|)")
+    plt.title(f"{hemi}: WT vs Shank3 (top {len(chosen)} by fixed order)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(outpath, dpi=150)
     plt.close()
 
+
+
+def plot_region_histograms(df_wt, df_sh, metric, hemi, outpath, region_order=None):
+    """
+    Plot histograms of metric values for WT and Shank3.
+    If region_order is provided, keep bar order consistent across plots.
+    """
+    # Extract values
+    vals_wt = df_wt[[metric, "acronym"]].dropna()
+    vals_sh = df_sh[[metric, "acronym"]].dropna()
+
+    if region_order is None:
+        # default: sort by |metric| descending
+        region_order = vals_wt.set_index("acronym")[metric].abs().sort_values(ascending=False).index.tolist()
+
+    # Align both datasets to region_order
+    vals_wt = vals_wt.set_index("acronym").reindex(region_order)
+    vals_sh = vals_sh.set_index("acronym").reindex(region_order)
+
+    x = np.arange(len(region_order))
+    plt.rcParams.update({'xtick.labelsize': 14, 'ytick.labelsize': 16})
+    width = 0.4
+
+    plt.figure(figsize=(30, max(6, len(region_order)*0.25)))
+    plt.bar(x - width/2, vals_wt[metric], width, label="WT", alpha=0.7)
+    plt.bar(x + width/2, vals_sh[metric], width, label="Shank3", alpha=0.7)
+
+    plt.axhline(0, color="black", linewidth=0.8)
+    plt.xticks(x, region_order, rotation=90)
+    plt.ylabel(metric)
+    plt.title(f"{hemi}: Histogram of {metric} (WT vs Shank3)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=150)
+    plt.close()
+
+    return region_order  # return so same order can be reused
+def plot_region_bars(df_wt, df_sh, metric, hemi, outpath, region_order, label_map):
+    df_wt, _ = _ensure_region_key(df_wt)
+    df_sh, _ = _ensure_region_key(df_sh)
+
+    wt_idx = df_wt.set_index("region_key")
+    sh_idx = df_sh.set_index("region_key")
+
+    vals_wt = wt_idx.reindex(region_order)[metric]
+    vals_sh = sh_idx.reindex(region_order)[metric]
+
+    x = np.arange(len(region_order))
+    width = 0.45
+    xlabels = [label_map.get(k, str(k)) for k in region_order]
+
+    plt.figure(figsize=(max(12, len(region_order)*0.18), 6))
+    plt.bar(x - width/2, vals_wt.to_numpy(float), width, label="WT", alpha=0.8)
+    plt.bar(x + width/2, vals_sh.to_numpy(float), width, label="Shank3", alpha=0.8)
+    plt.axhline(0, linewidth=0.8)
+    plt.xticks(x, xlabels, rotation=90)
+    plt.ylabel(metric)
+    plt.title(f"{hemi}: {metric} by region (fixed order)")
+    plt.legend(loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.15))
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=150)
+    plt.close()
+
+
+
+def plot_distribution_hist(df_wt, df_sh, metric, hemi, outpath):
+    """
+    True histogram of value distributions (order-free): WT vs Shank3.
+    Useful to compare spread/shape; complements the ordered bar figure.
+    """
+    vW = pd.to_numeric(df_wt[metric], errors="coerce").dropna().to_numpy(float)
+    vS = pd.to_numeric(df_sh[metric], errors="coerce").dropna().to_numpy(float)
+
+    plt.figure(figsize=(8,5))
+    # identical bins across both groups
+    all_vals = np.concatenate([vW, vS]) if len(vW) and len(vS) else (vW if len(vW) else vS)
+    bins = 30 if len(all_vals) > 0 else 10
+    rng  = (np.nanmin(all_vals), np.nanmax(all_vals)) if len(all_vals) else (-1,1)
+
+    plt.hist(vW, bins=bins, range=rng, alpha=0.6, label="WT", density=False)
+    plt.hist(vS, bins=bins, range=rng, alpha=0.6, label="Shank3", density=False)
+
+    plt.axvline(0, ls="--", linewidth=0.8)
+    plt.xlabel(metric)
+    plt.ylabel("Count")
+    plt.title(f"{hemi}: distribution of {metric}")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=150)
+    plt.close()
+
+
 def main():
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    # Load all six tables (WT/Shank3 × L/R/Delta)
-    def get_pair(hemi):
-        wt_df = load_sheet_like(effects_xlsx, f"WT_{hemi}")
-        sh_df = load_sheet_like(effects_xlsx, f"Shank3_{hemi}")
-        if wt_df is None or sh_df is None:
-            print(f"[WARN] Missing sheets for {hemi}.")
-            return None, None
-        # Ensure category column exists
-        wt_df = ensure_category(wt_df)
-        sh_df = ensure_category(sh_df)
-        return wt_df, sh_df
+    # Choose which metric anchors the ordering for each hemisphere
+    anchor_metric = metrics[0] if len(metrics) else "g"
 
-    # Create an Excel with category summaries
     writer = pd.ExcelWriter(str(Path(out_dir) / "category_summaries.xlsx"))
     for hemi in hemi_panels:
-        wt_df, sh_df = get_pair(hemi)
-        if wt_df is None: 
+        wt_df, sh_df = load_sheet_like(effects_xlsx, f"WT_{hemi}"), load_sheet_like(effects_xlsx, f"Shank3_{hemi}")
+        if wt_df is None or sh_df is None:
+            print(f"[WARN] Missing sheets for {hemi}.")
             continue
 
+        wt_df = ensure_category(wt_df)
+        sh_df = ensure_category(sh_df)
+
+        # ---- NEW: build a single, stable region order for this hemisphere
+        region_order = build_canonical_order(wt_df, sh_df, primary_metric=anchor_metric)
+        # Optional sanity check:
+        print(f"[{hemi}] first 10 in fixed order: {region_order[:10]}")
+
         for metric in metrics:
-            # Category summaries
+            # Category summaries (unchanged)
             wt_cat = make_category_summary(wt_df, metric, hemi, "WT")
             sh_cat = make_category_summary(sh_df, metric, hemi, "Shank3")
-            sheet_name_wt = f"{hemi}_WT_by_category_{metric}"
-            sheet_name_sh = f"{hemi}_Shank3_by_category_{metric}"
-            wt_cat.to_excel(writer, sheet_name=sheet_name_wt, index=False)
-            sh_cat.to_excel(writer, sheet_name=sheet_name_sh, index=False)
+            wt_cat.to_excel(writer, sheet_name=f"{hemi}_WT_by_category_{metric}", index=False)
+            sh_cat.to_excel(writer, sheet_name=f"{hemi}_Shank3_by_category_{metric}", index=False)
 
-            # Category comparison plot
+            # Category comparison plot (unchanged)
             plot_category_comparison(
                 wt_cat, sh_cat, metric, hemi,
                 outpath=Path(out_dir)/f"category_{hemi}_{metric}_WT_vs_Shank3.png"
             )
+            
+            label_map = build_label_map(wt_df, sh_df)
 
-            # Overlapped top-N region plot
+
             build_top_overlap_plot(
                 wt_df, sh_df, metric, hemi, top_n,
-                outpath=Path(out_dir)/f"regions_top{top_n}_{hemi}_{metric}_WT_vs_Shank3.png"
+                outpath=Path(out_dir)/f"regions_top{top_n}_{hemi}_{metric}_WT_vs_Shank3.png",
+                region_order=region_order,
+                label_map=label_map
+            )
+
+            plot_region_bars(
+                wt_df, sh_df, metric, hemi,
+                outpath=Path(out_dir)/f"bars_{hemi}_{metric}_WT_vs_Shank3.png",
+                region_order=region_order,
+                label_map=label_map
+            )
+
+            # ---- NEW: true distribution histogram (order-free)
+            plot_distribution_hist(
+                wt_df, sh_df, metric, hemi,
+                outpath=Path(out_dir)/f"hist_{hemi}_{metric}_WT_vs_Shank3.png"
             )
 
     writer.close()
